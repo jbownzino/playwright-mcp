@@ -1,3 +1,4 @@
 # Browser-Use dependencies
 browser-use
 python-dotenv
+aiohttp

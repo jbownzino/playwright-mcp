@@ -44,6 +44,15 @@ Thumbs.db
 # Browser data
 .browser_data/
 
+# Node.js / Game dependencies
+template-youtube-playables/node_modules/
+template-youtube-playables/dist/
+
+# Screenshots (keep directory but ignore contents)
+screenshots/*
+!screenshots/.gitkeep
+!screenshots/README.md
+
 # Testing
 .pytest_cache/
 .coverage

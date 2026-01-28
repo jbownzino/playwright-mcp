@@ -82,7 +82,14 @@ python run_task.py "Your custom task here"
 
 - `quickstart.py` - Example Browser-Use agent (accepts tasks as command-line arguments)
 - `run_task.py` - Flexible task runner for custom Browser-Use tasks
+- `play_game.py` - **Game automation script** - interact with local game at http://localhost:8080
+- `vision_example.py` - Example demonstrating vision capabilities (screenshot understanding)
+- `start_game.sh` - Start the Vite game server
 - `examples.md` - Examples of different tasks you can run
+- `VISION.md` - Guide to Browser-Use vision capabilities
+- `GAME_AUTOMATION.md` - **Guide for automating the local game**
+- `template-youtube-playables/` - Phaser 3 game (Basketball Shoot Out)
+- `screenshots/` - Screenshots from Browser-Use automation (automatically saved here)
 - `.env.example` - Template for environment variables (copy to `.env` and add your API key)
 - `.env` - Your environment variables (gitignored - add your API key here)
 - `requirements.txt` - Python dependencies
@@ -104,6 +111,26 @@ python run_task.py "Search for Python tutorials"
 python run_task.py "Find the top story on Hacker News"
 python run_task.py "Go to github.com and search for 'browser automation'"
 ```
+
+**Screenshots & Vision:**
+- Screenshots are automatically saved to the `screenshots/` folder
+- Each screenshot is timestamped and named based on the task
+- Screenshots are gitignored (won't be committed to git)
+- **Vision is enabled by default** - Browser-Use can "see" screenshots to understand page layout and get coordinates
+- See `VISION.md` for details on vision capabilities
+
+**Game Automation:**
+- **Automate the local Phaser game** running on http://localhost:8080
+- Start game server: `./start_game.sh`
+- Run automation: `python play_game.py "your task"`
+- Vision mode is essential for games (Canvas-based) - automatically enabled
+- See `GAME_AUTOMATION.md` for detailed game automation guide
+
+**Harmful Content Detection:**
+- **Monitor game for harmful content** using LLM vision
+- After 4 shots, a modal appears saying "This is harmful content"
+- Run monitor: `python monitor_harmful_content.py`
+- The LLM analyzes screenshots to detect harmful content in real-time
 
 See `examples.md` for more task examples and tips.
 
