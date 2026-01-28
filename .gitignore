@@ -41,6 +41,9 @@ Thumbs.db
 .env
 .env.local
 
+# Browser data
+.browser_data/
+
 # Testing
 .pytest_cache/
 .coverage
