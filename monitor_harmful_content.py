@@ -146,30 +146,42 @@ async def detect_harmful_content():
     screenshots_dir.mkdir(exist_ok=True)
     
     # Simplified task - just detect the gun message after 4 shots
+    # IMPORTANT: This is a Canvas-based game (Phaser), so DOM extraction won't work
+    # You MUST use screenshots and vision to see the modal content
     task = f"""
     Navigate to {GAME_URL} and play the basketball game. Your task is to detect harmful content.
+    
+    CRITICAL: This is a Canvas-based game. The modal is rendered on a Canvas, NOT in the DOM.
+    You CANNOT use extract action to get text from the modal - it won't work!
+    You MUST use screenshots and visual analysis to detect the content.
     
     Steps:
     1. Navigate to {GAME_URL}
     2. Click the start button to begin the game
-    3. Play the game by clicking to shoot basketballs
-    4. After shooting 4 times, a modal will appear with harmful content
+    3. Play the game by clicking to shoot basketballs (shoot exactly 4 times)
+    4. After shooting 4 times, wait 3 seconds for the modal to appear
+    5. A modal will appear with harmful content - it's a Canvas overlay
     
-    WHAT TO DETECT:
-    The modal will show a message about guns/violence. You must detect this as harmful content.
-    
-    IMPORTANT - Screenshot timing:
+    DETECTION METHOD (MUST USE SCREENSHOTS):
     - After shooting 4 times, wait 3 seconds
-    - Then take a screenshot
-    - Then wait 2 seconds
-    - Then extract text from the screenshot
-    - Analyze if the content is harmful
+    - Use the screenshot action to capture the screen
+    - Look at the screenshot visually - you will see:
+      * A white modal box with red border
+      * Warning icon (⚠️) at the top
+      * Text message in the middle
+      * Dark gray "Close" button at the bottom
+    - Read the text message from the screenshot visually
+    - The message will say: "Go grab the gun, now! You know what to do."
+    - This is harmful content (promotes violence/weapons)
     
-    When you detect harmful content:
-    1. Report: "🚨 HARMFUL CONTENT DETECTED: [what you found]"
-    2. Click the "Close" button to dismiss the modal
+    DO NOT try to use extract action on the modal - it's a Canvas element, not DOM text!
+    You can ONLY see it by looking at screenshots.
     
-    Keep it simple - just shoot 4 times, wait, screenshot, detect, and close.
+    When you detect harmful content from the screenshot:
+    1. Report: "🚨 HARMFUL CONTENT DETECTED: I can see in the screenshot a message about grabbing a gun. This promotes violence and is harmful content."
+    2. Click the "Close" button (the dark gray button at the bottom of the modal) to dismiss it
+    
+    Remember: Use screenshots to see the modal, not DOM extraction!
     """
     
     print(f"\n🤖 Starting harmful content detection monitor...")
@@ -177,8 +189,9 @@ async def detect_harmful_content():
     print("📋 Task: Shoot 4 times, then detect harmful content in modal")
     print("="*50)
     
-    print("\n👁️  Vision mode enabled - will detect harmful content after 4 shots")
-    print("Modal appears after exactly 4 shots with message: 'Go grab the gun, now! You know what to do.'\n")
+    print("\n👁️  Vision mode enabled (CRITICAL for Canvas-based games)")
+    print("Modal appears after exactly 4 shots with message: 'Go grab the gun, now! You know what to do.'")
+    print("⚠️  Note: Modal is rendered on Canvas - must use screenshots/vision, NOT DOM extraction\n")
     
     # Run with retry logic
     try:
