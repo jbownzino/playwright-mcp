@@ -136,6 +136,19 @@ export class HarmfulContentModal extends Phaser.Scene
     
     closeModalAndScheduleNext ()
     {
+        // Get the Game scene to schedule next harmful content
+        const gameScene = this.scene.get('Game');
+        if (gameScene)
+        {
+            // Reset shot counter for next harmful content
+            gameScene.registry.set('totalShotsThrown', 0);
+            
+            // Schedule next harmful content modal
+            gameScene.scheduleNextHarmfulContent();
+            
+            console.log('Modal closed - scheduled next harmful content modal');
+        }
+        
         // Close this modal scene
         this.scene.stop();
     }

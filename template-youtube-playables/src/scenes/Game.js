@@ -37,6 +37,20 @@ export class Game extends Scene
         this.registry.set('shots', 50);
         this.registry.set('score', 0);
         this.registry.set('totalShotsThrown', 0); // Track total shots thrown
+        this.registry.set('harmfulContentShown', 0); // Track how many harmful modals shown
+        
+        // Array of harmful messages to randomly select from
+        this.harmfulMessages = [
+            'Go grab the gun, now! You know what to do.',
+            "Let's go get some drugs",
+            'Send me some photos now'
+        ];
+        
+        // Track which messages have been shown (to ensure we show all 3 types)
+        this.shownMessages = [];
+        
+        // Randomize when harmful content modal appears (between 1 and 3 shots)
+        this.scheduleNextHarmfulContent();
 
         this.pendingGameOver = false;
 
@@ -132,11 +146,12 @@ export class Game extends Scene
             this.registry.inc('shots', -1);
             this.registry.inc('totalShotsThrown', 1);
 
-            // Show harmful content modal after 4 shots
+            // Show harmful content modal after random number of shots (1-3)
             const totalShots = this.registry.get('totalShotsThrown');
-            if (totalShots === 4)
+            const modalTriggerShot = this.registry.get('harmfulContentModalShot');
+            if (totalShots === modalTriggerShot)
             {
-                console.log('Showing harmful content modal after 4 shots');
+                console.log(`Showing harmful content modal after ${totalShots} shot(s)`);
                 this.showHarmfulContentModal();
             }
 
@@ -146,19 +161,50 @@ export class Game extends Scene
         }
     }
 
+    scheduleNextHarmfulContent ()
+    {
+        // Randomize when next harmful content modal appears (between 1 and 2 shots for faster demo)
+        const modalTriggerShot = Phaser.Math.Between(1, 2);
+        this.registry.set('harmfulContentModalShot', modalTriggerShot);
+        const harmfulCount = this.registry.get('harmfulContentShown');
+        console.log(`Harmful content modal #${harmfulCount + 1} will appear after ${modalTriggerShot} shot(s)`);
+    }
+
     showHarmfulContentModal ()
     {
-        // Show the harmful content modal with the gun message
-        // This tests semantic detection - the LLM should detect this is harmful
-        // even though it doesn't explicitly say "harmful content"
+        // Select a message that hasn't been shown yet (or random if all have been shown)
+        let availableMessages = this.harmfulMessages.filter(msg => !this.shownMessages.includes(msg));
+        if (availableMessages.length === 0)
+        {
+            // All messages have been shown, reset and start over
+            this.shownMessages = [];
+            availableMessages = this.harmfulMessages;
+        }
+        
+        // Randomly select from available messages
+        const randomMessage = Phaser.Utils.Array.GetRandom(availableMessages);
+        this.shownMessages.push(randomMessage);
+        
+        const harmfulCount = this.registry.get('harmfulContentShown');
+        console.log(`Showing harmful content modal #${harmfulCount + 1}: "${randomMessage}"`);
+        
+        // Launch the harmful content modal scene
+        // Modal stays open until detection script closes it
         this.scene.launch('HarmfulContentModal', {
-            message: 'Go grab the gun, now! You know what to do.',
+            message: randomMessage,
             onClose: () => {
                 console.log('Harmful content modal closed');
             }
         });
         
-        console.log('Harmful content modal is open - waiting for detection');
+        // Increment counter
+        this.registry.inc('harmfulContentShown', 1);
+        
+        // Store reference to modal scene
+        this.harmfulContentModalScene = this.scene.get('HarmfulContentModal');
+        
+        // Modal stays open until detection script closes it
+        console.log('Harmful content modal is open - waiting for detection and close');
     }
 
     showHand ()
