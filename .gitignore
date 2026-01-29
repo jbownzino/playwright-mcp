@@ -19,6 +19,9 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.chrome-debug-profile/*
+.chrome-debug-profile
+.git.backup
 
 # Virtual Environment
 venv/
