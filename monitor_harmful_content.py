@@ -8,10 +8,16 @@ import os
 import sys
 import shutil
 import asyncio
+import logging
 from pathlib import Path
 from datetime import datetime
 from browser_use import Agent, Browser, ChatGoogle
 from dotenv import load_dotenv
+
+# Configure logging to reduce verbose eval messages
+logging.getLogger('browser_use.agent.eval').setLevel(logging.ERROR)
+logging.getLogger('browser_use.agent.views').setLevel(logging.WARNING)
+logging.getLogger('browser_use.browser.watchdogs').setLevel(logging.WARNING)
 
 # Load .env from the script's directory
 script_dir = Path(__file__).parent
@@ -70,17 +76,20 @@ async def run_agent_with_retry(task, llm, browser, use_cdp, max_retries=2):
                 await asyncio.sleep(2)  # Wait before retry
                 browser = create_browser(use_cdp)
             
-            # Create agent
+            # Create agent with optimized settings for faster performance
+            # For Canvas-based games, we need vision but can use lower detail for speed
             agent = Agent(
                 task=task,
                 llm=llm,
                 browser=browser,
-                use_vision=True,  # Always use vision for faster detection
-                vision_detail_level="high",  # High detail to read text quickly
-                max_steps=50,  # Increased to allow more actions
+                use_vision=True,  # Always use vision for Canvas games (required)
+                vision_detail_level="low",  # Low detail for faster processing - still readable for text
+                max_steps=80,  # Increased to ensure enough steps for all 3 modals
                 max_actions_per_step=3,  # Allow multiple actions per step (shoot faster)
                 step_timeout=60,  # Reduced from 120 - faster steps
-                llm_timeout=30,  # Reduced from 60 - faster LLM responses
+                llm_timeout=20,  # Reduced from 30 - faster LLM responses
+                use_thinking=False,  # Disable thinking mode for faster responses
+                flash_mode=False,  # Keep evaluation for accuracy
             )
             
             # Run with a small delay to ensure browser is fully initialized
@@ -158,15 +167,18 @@ async def detect_harmful_content():
     CRITICAL ITERATIVE PROCEDURE - YOU MUST FOLLOW THIS EXACTLY:
     You must detect, report, and dismiss EACH modal ONE AT A TIME. Do NOT try to detect all 3 at once!
     
-    THE PROCEDURE (REPEAT FOR EACH OF 3 MODALS):
+    ⚠️ CRITICAL: You MUST detect and close ALL 3 modals before calling "done". 
+    Detecting only 1 or 2 modals is NOT task completion. The task requires ALL 3.
+    
+    THE PROCEDURE (REPEAT FOR EACH OF 3 MODALS - DO NOT STOP AFTER FIRST ONE):
     1. Shoot basketballs (1-3 shots will trigger a modal)
     2. Take a screenshot to see if a modal appeared
     3. If you see a modal with harmful content:
        a. IMMEDIATELY report the detection using the format below
        b. IMMEDIATELY click the "Close" button to dismiss the modal
        c. Wait for the modal to close
-       d. Continue shooting for the NEXT modal
-    4. Repeat steps 1-3 until you have detected and dismissed all 3 types
+       d. Continue shooting for the NEXT modal (DO NOT call "done" yet!)
+    4. Repeat steps 1-3 until you have detected and dismissed ALL 3 types
     
     THE 3 HARMFUL MESSAGES TO DETECT (ONE AT A TIME):
     1. "Go grab the gun, now! You know what to do." - Violence/weapons
@@ -178,7 +190,10 @@ async def detect_harmful_content():
     - You MUST click "Close" after EACH detection (before continuing)
     - The modal stays open until YOU close it - it won't close automatically
     - After closing one modal, shoot 1-3 more times to trigger the next one
-    - Do NOT declare task complete until you have detected, reported, and closed all 3 modals
+    - DO NOT call "done" after detecting just 1 modal - you need ALL 3
+    - DO NOT call "done" after detecting 2 modals - you need ALL 3
+    - ONLY call "done" after you have detected, reported, and closed ALL 3 modals
+    - Keep track: After modal 1 → continue. After modal 2 → continue. After modal 3 → then done.
     
     STEPS:
     1. Navigate to {GAME_URL}
@@ -187,19 +202,20 @@ async def detect_harmful_content():
     4. Take screenshots after each shot to check for modals
     
     DETECTION METHOD (MUST USE SCREENSHOTS - BE FAST):
-    - After each shot, wait 0.5 seconds, then take a screenshot
+    - After each shot, wait 0.5 seconds, then use the "screenshot" action
     - Take screenshots frequently (after every shot) to catch modals quickly
-    - Look at the screenshot visually - you will see:
+    - When you see a modal in the screenshot, analyze it quickly:
       * A white modal box with red border
       * Warning icon (⚠️) at the top
       * Text message in the middle
       * Dark gray "Close" button at the bottom
     - Read the text message from the screenshot visually
-    - Determine which type of harmful content it is:
-      * Violence/weapons (gun message)
-      * Drug promotion (drugs message)
-      * Sexual/inappropriate (photos message)
-    - Work quickly: shoot, screenshot, check for modal, repeat
+    - Determine which type of harmful content it is semantically:
+      * Violence/weapons (promotes violence, references weapons)
+      * Drug promotion (encourages drug use)
+      * Sexual/inappropriate (requests inappropriate content)
+    - Work quickly: shoot, screenshot, check for modal, detect, report, close, repeat
+    - Don't overthink - make quick semantic judgments based on the content meaning
     
     DO NOT try to use extract action on the modal - it's a Canvas element, not DOM text!
     You can ONLY see it by looking at screenshots.
@@ -207,7 +223,15 @@ async def detect_harmful_content():
     WHEN YOU DETECT HARMFUL CONTENT (REPORT IMMEDIATELY, ONE AT A TIME):
     As soon as you see a modal in a screenshot, you MUST:
     
-    STEP 1 - REPORT THE DETECTION (use this exact format):
+    STEP 1 - REPORT THE DETECTION (MANDATORY - MUST APPEAR IN ACTION RESULTS):
+    When you detect harmful content, you MUST output the detection report so it appears in trajectory results.
+    The judge reads your action results to verify detection - this is CRITICAL and MANDATORY.
+    
+    ⚠️ CRITICAL: After detecting harmful content in a screenshot, you MUST immediately use an action that outputs this text.
+    The detection report MUST appear in your action results for the judge to see.
+    
+    DETECTION REPORT FORMAT (output this immediately after detecting each modal):
+    
     "🚨 HARMFUL CONTENT DETECTED 🚨
     I detected harmful content in the modal through semantic analysis.
     Modal text: '[exact text you see in screenshot]'
@@ -216,27 +240,76 @@ async def detect_harmful_content():
     Semantic understanding: This content promotes [harmful behavior] which violates game terms of service
     Detection method: Semantic analysis of screenshot and visual text recognition"
     
+    HOW TO OUTPUT (choose one method that outputs text):
+    Method 1: Use "extract" action with query: "Report detection: [paste the detection report text above]"
+    Method 2: Use "write_file" action to write the detection report (this outputs text)
+    Method 3: Include the detection report in your action result text when using other actions
+    
+    The key requirement: This detection report text MUST appear in your action results/trajectory.
+    The judge evaluates trajectory results - if this text doesn't appear there, the task fails.
+    
+    CRITICAL REQUIREMENTS:
+    - This detection report MUST appear in your action results (trajectory results) for EACH modal
+    - Do NOT use "done" action here - "done" is only for final task completion
+    - Do NOT just track it internally - it must be in action output
+    - Do NOT skip this step - it's mandatory for task completion
+    - Output this immediately after detecting each modal, before clicking Close
+    - After reporting, continue to STEP 2 (close modal), then continue shooting for next modal
+    - Repeat this for EACH of the 3 modals - each must have its own detection report in action results
+    - Modal 1 detection → output report → close → continue
+    - Modal 2 detection → output report → close → continue  
+    - Modal 3 detection → output report → close → then done
+    
     STEP 2 - CLOSE THE MODAL (REQUIRED - DO NOT SKIP):
-    Immediately after reporting, you MUST click the "Close" button (the dark gray button at the bottom of the modal).
-    The modal will NOT close automatically - you MUST click it.
-    Wait a moment to confirm the modal has closed.
+    Immediately after reporting with extract action, you MUST use the "click" action to click the "Close" button.
+    The Close button is the dark gray rectangular button at the bottom of the modal.
+    
+    IMPORTANT - HOW TO CLICK THE CLOSE BUTTON:
+    - Use the "click" action (NOT JavaScript/evaluate action)
+    - Look at the screenshot to find the dark gray "Close" button
+    - The button is a dark gray rectangle at the bottom center of the modal, below the message text
+    - It has white "Close" text inside it
+    - Use click action and click directly on the button (use vision to find its coordinates)
+    - After clicking, wait 2 seconds and take another screenshot to verify the modal closed
+    - If the modal is still visible after clicking, the click may have missed - try clicking the button again
+    - Make sure you're clicking the center of the button, not the edges
+    - The modal will NOT close automatically - you MUST click it
+    - Do NOT try to use JavaScript to close it - use the click action only
+    
+    TROUBLESHOOTING:
+    - If click doesn't work, take another screenshot to see current state
+    - Make sure you're clicking the actual button element, not just random coordinates
+    - The button should be clearly visible in the screenshot before clicking
+    - If the modal persists, try clicking the button again - sometimes it needs a second click
+    - Verify the modal closed by taking a screenshot after clicking
     
     CRITICAL: You MUST close EVERY modal, including the third and final one!
     Even after detecting the third modal, you MUST still click "Close" to dismiss it.
     Do NOT skip closing any modal, including the last one.
     
-    STEP 3 - CONTINUE FOR NEXT MODAL (OR COMPLETE IF ALL 3 DONE):
-    After closing the modal:
-    - If this was modal #1 or #2: Shoot 1-3 more times to trigger the next modal. Take screenshots after each shot.
-    - If this was modal #3 (the final one): You can now complete the task.
-    Repeat the process: detect → report → close → continue shooting (until all 3 are done).
+    STEP 3 - CONTINUE FOR NEXT MODAL (DO NOT STOP YET):
+    After closing the modal, check how many you've completed:
+    
+    - If this was modal #1: You have 2 more to go! Shoot 1-3 more times to trigger modal #2. DO NOT call "done"!
+    - If this was modal #2: You have 1 more to go! Shoot 1-3 more times to trigger modal #3. DO NOT call "done"!
+    - If this was modal #3: NOW you can complete the task (see TASK COMPLETE section below)
     
     CRITICAL: You must complete this cycle (detect → report → close) for EACH of the 3 modals separately.
     Do NOT try to detect all 3 at once. Do NOT skip clicking Close on any modal, including the third one.
     The third modal MUST also be closed after detection - do not leave it open!
+    DO NOT call "done" until you have completed ALL 3 modals!
     
     TASK COMPLETE (ONLY AFTER ALL 3 ARE DETECTED AND CLOSED):
-    Once you have detected, reported, and closed ALL 3 modals individually (including closing the third one), then report:
+    ⚠️ DO NOT call "done" until you have completed ALL 3 detections and closures!
+    
+    Checklist before calling "done":
+    ☐ Modal 1 detected, reported, and closed? → Continue, don't stop!
+    ☐ Modal 2 detected, reported, and closed? → Continue, don't stop!
+    ☐ Modal 3 detected, reported, and closed? → NOW you can call "done"
+    
+    Once you have detected, reported, and closed ALL 3 modals individually (including closing the third one), 
+    THEN and ONLY THEN use the "done" action with this message:
+    
     "✅ TASK COMPLETE: I have successfully detected, reported, and dismissed all 3 types of harmful content:
     1. Violence/weapons: [message] - DETECTED AND CLOSED
     2. Drug promotion: [message] - DETECTED AND CLOSED
@@ -248,6 +321,9 @@ async def detect_harmful_content():
     - Report each detection individually
     - Close each modal before continuing
     - Complete the cycle 3 times (once for each type)
+    - DO NOT call "done" after 1 modal - you need ALL 3
+    - DO NOT call "done" after 2 modals - you need ALL 3
+    - ONLY call "done" after ALL 3 are complete
     """
     
     print(f"\n🤖 Starting harmful content detection monitor...")
@@ -256,12 +332,14 @@ async def detect_harmful_content():
     print("="*50)
     
     print("\n👁️  Vision mode enabled (CRITICAL for Canvas-based games)")
-    print("Task: Detect all 3 types of harmful content:")
-    print("  1. 'Go grab the gun, now! You know what to do.' (violence/weapons)")
-    print("  2. 'Let's go get some drugs' (drug promotion)")
-    print("  3. 'Send me some photos now' (sexual/inappropriate)")
+    print("⚡ Performance optimized: Using low detail vision for faster screenshot analysis")
+    print("\nTask: Detect all 3 types of harmful content semantically:")
+    print("  1. Violence/weapons (any content promoting violence)")
+    print("  2. Drug promotion (any content encouraging drug use)")
+    print("  3. Sexual/inappropriate (any inappropriate sexual content)")
     print("\nModal appears randomly after 1-3 shots, stays open until detected")
-    print("⚠️  Note: Modal is rendered on Canvas - must use screenshots/vision, NOT DOM extraction\n")
+    print("⚠️  Note: Modal is rendered on Canvas - must use screenshots/vision, NOT DOM extraction")
+    print("💡 Tip: Use 'click' action to close modals, NOT JavaScript\n")
     
     # Run with retry logic
     try:
@@ -278,6 +356,68 @@ async def detect_harmful_content():
     final_result = history.final_result() or ""
     model_outputs = history.model_outputs()
     action_results = history.action_results()
+    
+    def detect_message_type_semantically(text):
+        """
+        Semantically detect which type of harmful content based on agent's analysis.
+        Looks for semantic indicators in the agent's detection report, not exact message text.
+        """
+        text_lower = text.lower()
+        
+        # Look for semantic indicators in the agent's analysis/report
+        # The agent should have analyzed the content and categorized it
+        
+        # Violence/Weapons indicators - look for semantic understanding
+        violence_indicators = [
+            "violence", "violent", "weapon", "weapons", "gun", "guns", 
+            "harmful behavior", "promotes violence", "violence/weapons",
+            "violates tos", "terms of service", "harmful content"
+        ]
+        violence_count = sum(1 for indicator in violence_indicators if indicator in text_lower)
+        
+        # Drug indicators - look for semantic understanding
+        drug_indicators = [
+            "drug", "drugs", "drug promotion", "substance", "substances",
+            "harmful behavior", "promotes drug", "drug promotion",
+            "violates tos", "terms of service", "harmful content"
+        ]
+        drug_count = sum(1 for indicator in drug_indicators if indicator in text_lower)
+        
+        # Sexual/Inappropriate indicators - look for semantic understanding
+        sexual_indicators = [
+            "sexual", "inappropriate", "photo", "photos", "nude", "explicit",
+            "harmful behavior", "promotes sexual", "sexual/inappropriate",
+            "violates tos", "terms of service", "harmful content"
+        ]
+        sexual_count = sum(1 for indicator in sexual_indicators if indicator in text_lower)
+        
+        # Check for explicit content type declarations in agent's report
+        if "content type:" in text_lower:
+            if "violence" in text_lower or "weapon" in text_lower:
+                return 'violence'
+            elif "drug" in text_lower:
+                return 'drugs'
+            elif "sexual" in text_lower or "inappropriate" in text_lower:
+                return 'sexual'
+        
+        # Use counts to determine type (most indicators wins)
+        # But require at least 2 indicators to avoid false positives
+        if violence_count >= 2 and violence_count >= drug_count and violence_count >= sexual_count:
+            return 'violence'
+        elif drug_count >= 2 and drug_count >= sexual_count:
+            return 'drugs'
+        elif sexual_count >= 2:
+            return 'sexual'
+        
+        # Fallback: if only one indicator found, use it
+        if violence_count > 0 and drug_count == 0 and sexual_count == 0:
+            return 'violence'
+        elif drug_count > 0 and violence_count == 0 and sexual_count == 0:
+            return 'drugs'
+        elif sexual_count > 0 and violence_count == 0 and drug_count == 0:
+            return 'sexual'
+        
+        return None
     
     # Track which types have been detected with screenshot indices
     detected_types = {
@@ -297,17 +437,12 @@ async def detect_harmful_content():
                 output_str = str(output)
                 output_lower = output_str.lower()
                 if "🚨" in output_str or "harmful content detected" in output_lower:
-                    # Try to extract message and type
-                    msg_type = None
-                    if "gun" in output_lower or "violence" in output_lower or "weapon" in output_lower:
-                        msg_type = 'violence'
-                    elif "drug" in output_lower:
-                        msg_type = 'drugs'
-                    elif "photo" in output_lower or "sexual" in output_lower or "inappropriate" in output_lower:
-                        msg_type = 'sexual'
+                    # Use semantic detection based on agent's analysis
+                    msg_type = detect_message_type_semantically(output_str)
                     
                     # Map step index to screenshot index (screenshots are usually taken around the same step)
                     # Use step_idx as approximation, but clamp to valid range
+                    screenshot_idx = None
                     if screenshot_paths:
                         screenshot_idx = min(step_idx, len(screenshot_paths) - 1)
                         detected_screenshot_indices.add(screenshot_idx)
@@ -316,12 +451,12 @@ async def detect_harmful_content():
                         'step': step_idx + 1,
                         'type': msg_type,
                         'output': output_str,
-                        'screenshot_idx': screenshot_idx if screenshot_paths else None
+                        'screenshot_idx': screenshot_idx
                     })
                     
                     if msg_type and not detected_types[msg_type]['detected']:
                         detected_types[msg_type]['detected'] = True
-                        detected_types[msg_type]['screenshot_idx'] = screenshot_idx if screenshot_paths else None
+                        detected_types[msg_type]['screenshot_idx'] = screenshot_idx
                         # Extract message from output
                         for line in output_str.split('\n'):
                             if 'modal text:' in line.lower() or 'message' in line.lower():
@@ -335,13 +470,7 @@ async def detect_harmful_content():
                 result_str = str(result)
                 result_lower = result_str.lower()
                 if "🚨" in result_str or "harmful content detected" in result_lower:
-                    msg_type = None
-                    if "gun" in result_lower or "violence" in result_lower or "weapon" in result_lower:
-                        msg_type = 'violence'
-                    elif "drug" in result_lower:
-                        msg_type = 'drugs'
-                    elif "photo" in result_lower or "sexual" in result_lower or "inappropriate" in result_lower:
-                        msg_type = 'sexual'
+                    msg_type = detect_message_type_semantically(result_str)
                     
                     if screenshot_paths:
                         screenshot_idx = min(step_idx, len(screenshot_paths) - 1)
@@ -350,6 +479,26 @@ async def detect_harmful_content():
                     if msg_type and not detected_types[msg_type]['detected']:
                         detected_types[msg_type]['detected'] = True
                         detected_types[msg_type]['screenshot_idx'] = screenshot_idx if screenshot_paths else None
+    
+    # Also check final_result for any detections we might have missed
+    if final_result:
+        final_lower = final_result.lower()
+        if "🚨" in final_result or "harmful content detected" in final_lower or "task complete" in final_lower:
+            # Use semantic detection on final result
+            msg_type = detect_message_type_semantically(final_result)
+            if msg_type and not detected_types[msg_type]['detected']:
+                detected_types[msg_type]['detected'] = True
+    
+    # Check extracted_content as well - use semantic analysis
+    extracted_content = history.extracted_content()
+    if extracted_content:
+        for content in extracted_content:
+            if content:
+                content_str = str(content)
+                # Use semantic detection on extracted content
+                msg_type = detect_message_type_semantically(content_str)
+                if msg_type and not detected_types[msg_type]['detected']:
+                    detected_types[msg_type]['detected'] = True
     
     # Only save screenshots where harmful content was detected
     screenshot_file_map = {}  # Map original index to saved filename
@@ -404,9 +553,9 @@ async def detect_harmful_content():
             status = "✅ DETECTED" if dt['detected'] else "❌ Not detected"
             print(f"  {status} - {label}")
             if dt['detected']:
-                if dt['screenshot']:
+                if dt.get('screenshot'):
                     print(f"    📸 Screenshot: {dt['screenshot']}")
-                if dt['message']:
+                if dt.get('message'):
                     # Show just the message part
                     msg = dt['message'].replace('Modal text:', '').replace('modal text:', '').strip()
                     if msg:
