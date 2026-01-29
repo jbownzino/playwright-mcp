@@ -11,6 +11,13 @@ export class HarmfulContentModal extends Phaser.Scene
     {
         const { message = 'This is harmful content', onClose } = data;
         
+        // Bring this scene to the top to ensure modal appears above all game content
+        this.scene.bringToTop();
+        
+        // Use very high depth values to ensure modal appears above all game elements
+        // Phaser depth can go up to very high numbers, using 10000+ to ensure it's on top
+        const MODAL_DEPTH = 10000;
+        
         // Create semi-transparent background overlay
         const overlay = this.add.rectangle(
             this.cameras.main.centerX,
@@ -19,7 +26,7 @@ export class HarmfulContentModal extends Phaser.Scene
             this.cameras.main.height,
             0x000000,
             0.7
-        ).setDepth(100).setInteractive();
+        ).setDepth(MODAL_DEPTH).setInteractive();
 
         // Create modal container
         const modalWidth = 600;
@@ -35,7 +42,7 @@ export class HarmfulContentModal extends Phaser.Scene
             modalHeight,
             0xffffff,
             0.95
-        ).setDepth(101).setStrokeStyle(4, 0xff0000);
+        ).setDepth(MODAL_DEPTH + 1).setStrokeStyle(4, 0xff0000);
 
         // Warning icon or text
         const warningText = this.add.text(
@@ -47,7 +54,7 @@ export class HarmfulContentModal extends Phaser.Scene
                 fontSize: 64,
                 color: '#ff0000'
             }
-        ).setDepth(102).setOrigin(0.5);
+        ).setDepth(MODAL_DEPTH + 2).setOrigin(0.5);
 
         // Message text
         const messageText = this.add.text(
@@ -61,7 +68,7 @@ export class HarmfulContentModal extends Phaser.Scene
                 align: 'center',
                 wordWrap: { width: modalWidth - 40 }
             }
-        ).setDepth(102).setOrigin(0.5);
+        ).setDepth(MODAL_DEPTH + 2).setOrigin(0.5);
 
         // Close button
         const closeButton = this.add.rectangle(
@@ -70,7 +77,7 @@ export class HarmfulContentModal extends Phaser.Scene
             200,
             60,
             0x333333
-        ).setDepth(102).setInteractive({ useHandCursor: true });
+        ).setDepth(MODAL_DEPTH + 2).setInteractive({ useHandCursor: true });
 
         const closeButtonText = this.add.text(
             modalX,
@@ -81,7 +88,7 @@ export class HarmfulContentModal extends Phaser.Scene
                 fontSize: 24,
                 color: '#ffffff'
             }
-        ).setDepth(103).setOrigin(0.5);
+        ).setDepth(MODAL_DEPTH + 3).setOrigin(0.5);
 
         // Close button hover effect
         closeButton.on('pointerover', () => {

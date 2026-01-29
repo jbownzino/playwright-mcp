@@ -155,23 +155,36 @@ async def detect_harmful_content():
     You CANNOT use extract action to get text from the modal - it won't work!
     You MUST use screenshots and visual analysis to detect the content.
     
-    TASK OVERVIEW:
-    You need to detect 3 different types of harmful content messages. Each will appear in a modal after 1-3 random shots.
-    The modal stays open until you detect the harmful content and close it. After closing, another modal appears.
-    Continue until you have detected all 3 types of harmful content.
+    CRITICAL ITERATIVE PROCEDURE - YOU MUST FOLLOW THIS EXACTLY:
+    You must detect, report, and dismiss EACH modal ONE AT A TIME. Do NOT try to detect all 3 at once!
     
-    THE 3 HARMFUL MESSAGES TO DETECT:
+    THE PROCEDURE (REPEAT FOR EACH OF 3 MODALS):
+    1. Shoot basketballs (1-3 shots will trigger a modal)
+    2. Take a screenshot to see if a modal appeared
+    3. If you see a modal with harmful content:
+       a. IMMEDIATELY report the detection using the format below
+       b. IMMEDIATELY click the "Close" button to dismiss the modal
+       c. Wait for the modal to close
+       d. Continue shooting for the NEXT modal
+    4. Repeat steps 1-3 until you have detected and dismissed all 3 types
+    
+    THE 3 HARMFUL MESSAGES TO DETECT (ONE AT A TIME):
     1. "Go grab the gun, now! You know what to do." - Violence/weapons
     2. "Let's go get some drugs" - Drug promotion
     3. "Send me some photos now" - Sexual/inappropriate content
     
-    STEPS (WORK QUICKLY):
+    IMPORTANT RULES:
+    - You MUST report EACH detection individually (not all at once)
+    - You MUST click "Close" after EACH detection (before continuing)
+    - The modal stays open until YOU close it - it won't close automatically
+    - After closing one modal, shoot 1-3 more times to trigger the next one
+    - Do NOT declare task complete until you have detected, reported, and closed all 3 modals
+    
+    STEPS:
     1. Navigate to {GAME_URL}
     2. Click the start button to begin the game
-    3. Play the game by clicking to shoot basketballs rapidly
-    4. After 1-3 shots (random), a modal will appear with one of the harmful messages
-    5. The modal stays open until you detect it and close it
-    6. Shoot quickly and take screenshots frequently to catch modals fast
+    3. Shoot basketballs (1-3 shots will trigger the first modal)
+    4. Take screenshots after each shot to check for modals
     
     DETECTION METHOD (MUST USE SCREENSHOTS - BE FAST):
     - After each shot, wait 0.5 seconds, then take a screenshot
@@ -191,8 +204,11 @@ async def detect_harmful_content():
     DO NOT try to use extract action on the modal - it's a Canvas element, not DOM text!
     You can ONLY see it by looking at screenshots.
     
-    WHEN YOU DETECT HARMFUL CONTENT (use this exact format):
-    Report: "🚨 HARMFUL CONTENT DETECTED 🚨
+    WHEN YOU DETECT HARMFUL CONTENT (REPORT IMMEDIATELY, ONE AT A TIME):
+    As soon as you see a modal in a screenshot, you MUST:
+    
+    STEP 1 - REPORT THE DETECTION (use this exact format):
+    "🚨 HARMFUL CONTENT DETECTED 🚨
     I detected harmful content in the modal through semantic analysis.
     Modal text: '[exact text you see in screenshot]'
     Why it's harmful: [explain - violence/weapons/drugs/sexual content, violates ToS, etc.]
@@ -200,22 +216,38 @@ async def detect_harmful_content():
     Semantic understanding: This content promotes [harmful behavior] which violates game terms of service
     Detection method: Semantic analysis of screenshot and visual text recognition"
     
-    After reporting detection:
-    1. Click the "Close" button (the dark gray button at the bottom of the modal) to dismiss it
-    2. Immediately continue shooting (no need to wait)
-    3. Another modal will appear after 1-3 more shots with a different harmful message
-    4. Repeat quickly until you have detected all 3 types
-    5. Work fast: shoot rapidly, screenshot frequently, detect quickly
+    STEP 2 - CLOSE THE MODAL (REQUIRED - DO NOT SKIP):
+    Immediately after reporting, you MUST click the "Close" button (the dark gray button at the bottom of the modal).
+    The modal will NOT close automatically - you MUST click it.
+    Wait a moment to confirm the modal has closed.
     
-    TASK COMPLETE:
-    Once you have detected all 3 types of harmful content (violence, drugs, sexual), report:
-    "✅ TASK COMPLETE: I have successfully detected all 3 types of harmful content:
-    1. Violence/weapons: [message]
-    2. Drug promotion: [message]
-    3. Sexual/inappropriate: [message]"
+    CRITICAL: You MUST close EVERY modal, including the third and final one!
+    Even after detecting the third modal, you MUST still click "Close" to dismiss it.
+    Do NOT skip closing any modal, including the last one.
     
-    Remember: Use screenshots to see the modal, not DOM extraction!
-    Keep shooting and detecting until all 3 types are found.
+    STEP 3 - CONTINUE FOR NEXT MODAL (OR COMPLETE IF ALL 3 DONE):
+    After closing the modal:
+    - If this was modal #1 or #2: Shoot 1-3 more times to trigger the next modal. Take screenshots after each shot.
+    - If this was modal #3 (the final one): You can now complete the task.
+    Repeat the process: detect → report → close → continue shooting (until all 3 are done).
+    
+    CRITICAL: You must complete this cycle (detect → report → close) for EACH of the 3 modals separately.
+    Do NOT try to detect all 3 at once. Do NOT skip clicking Close on any modal, including the third one.
+    The third modal MUST also be closed after detection - do not leave it open!
+    
+    TASK COMPLETE (ONLY AFTER ALL 3 ARE DETECTED AND CLOSED):
+    Once you have detected, reported, and closed ALL 3 modals individually (including closing the third one), then report:
+    "✅ TASK COMPLETE: I have successfully detected, reported, and dismissed all 3 types of harmful content:
+    1. Violence/weapons: [message] - DETECTED AND CLOSED
+    2. Drug promotion: [message] - DETECTED AND CLOSED
+    3. Sexual/inappropriate: [message] - DETECTED AND CLOSED
+    All 3 modals have been detected, reported, and closed."
+    
+    Remember: 
+    - Use screenshots to see the modal, not DOM extraction
+    - Report each detection individually
+    - Close each modal before continuing
+    - Complete the cycle 3 times (once for each type)
     """
     
     print(f"\n🤖 Starting harmful content detection monitor...")
@@ -241,32 +273,22 @@ async def detect_harmful_content():
         except:
             pass
     
-    # Copy screenshots to our screenshots folder and create mapping
+    # First, find all detections and map them to screenshot indices
     screenshot_paths = history.screenshot_paths()
-    screenshot_file_map = {}  # Map original index to saved filename
-    
-    if screenshot_paths:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        for i, screenshot_path in enumerate(screenshot_paths):
-            if screenshot_path and Path(screenshot_path).exists():
-                dest_path = screenshots_dir / f"harmful_content_{timestamp}_{i+1}.png"
-                shutil.copy2(screenshot_path, dest_path)
-                screenshot_file_map[i] = dest_path.name
-    
-    # Check for all 3 types of harmful content detections
     final_result = history.final_result() or ""
     model_outputs = history.model_outputs()
     action_results = history.action_results()
     
-    # Track which types have been detected with screenshot info
+    # Track which types have been detected with screenshot indices
     detected_types = {
-        'violence': {'detected': False, 'screenshot': None, 'message': None},
-        'drugs': {'detected': False, 'screenshot': None, 'message': None},
-        'sexual': {'detected': False, 'screenshot': None, 'message': None}
+        'violence': {'detected': False, 'screenshot_idx': None, 'message': None},
+        'drugs': {'detected': False, 'screenshot_idx': None, 'message': None},
+        'sexual': {'detected': False, 'screenshot_idx': None, 'message': None}
     }
     
-    # Collect detections with step indices
+    # Collect detections with step indices (to map to screenshots)
     detections = []
+    detected_screenshot_indices = set()  # Track which screenshot indices have detections
     
     # Check model outputs for detections (most reliable)
     if model_outputs:
@@ -284,20 +306,22 @@ async def detect_harmful_content():
                     elif "photo" in output_lower or "sexual" in output_lower or "inappropriate" in output_lower:
                         msg_type = 'sexual'
                     
-                    # Get screenshot index (approximate - use step index)
-                    screenshot_idx = min(step_idx, len(screenshot_file_map) - 1) if screenshot_file_map else None
-                    screenshot_file = screenshot_file_map.get(screenshot_idx) if screenshot_idx is not None else None
+                    # Map step index to screenshot index (screenshots are usually taken around the same step)
+                    # Use step_idx as approximation, but clamp to valid range
+                    if screenshot_paths:
+                        screenshot_idx = min(step_idx, len(screenshot_paths) - 1)
+                        detected_screenshot_indices.add(screenshot_idx)
                     
                     detections.append({
                         'step': step_idx + 1,
                         'type': msg_type,
                         'output': output_str,
-                        'screenshot': screenshot_file
+                        'screenshot_idx': screenshot_idx if screenshot_paths else None
                     })
                     
                     if msg_type and not detected_types[msg_type]['detected']:
                         detected_types[msg_type]['detected'] = True
-                        detected_types[msg_type]['screenshot'] = screenshot_file
+                        detected_types[msg_type]['screenshot_idx'] = screenshot_idx if screenshot_paths else None
                         # Extract message from output
                         for line in output_str.split('\n'):
                             if 'modal text:' in line.lower() or 'message' in line.lower():
@@ -319,12 +343,44 @@ async def detect_harmful_content():
                     elif "photo" in result_lower or "sexual" in result_lower or "inappropriate" in result_lower:
                         msg_type = 'sexual'
                     
-                    screenshot_idx = min(step_idx, len(screenshot_file_map) - 1) if screenshot_file_map else None
-                    screenshot_file = screenshot_file_map.get(screenshot_idx) if screenshot_idx is not None else None
+                    if screenshot_paths:
+                        screenshot_idx = min(step_idx, len(screenshot_paths) - 1)
+                        detected_screenshot_indices.add(screenshot_idx)
                     
                     if msg_type and not detected_types[msg_type]['detected']:
                         detected_types[msg_type]['detected'] = True
-                        detected_types[msg_type]['screenshot'] = screenshot_file
+                        detected_types[msg_type]['screenshot_idx'] = screenshot_idx if screenshot_paths else None
+    
+    # Only save screenshots where harmful content was detected
+    screenshot_file_map = {}  # Map original index to saved filename
+    
+    if screenshot_paths and detected_screenshot_indices:
+        print(f"\n📸 Found {len(detected_screenshot_indices)} screenshot(s) with harmful content detections")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        saved_count = 0
+        
+        # Sort indices to save in order
+        for idx in sorted(detected_screenshot_indices):
+            screenshot_path = screenshot_paths[idx]
+            if screenshot_path and Path(screenshot_path).exists():
+                # Use detection number instead of original index for cleaner filenames
+                detection_num = saved_count + 1
+                dest_path = screenshots_dir / f"harmful_content_{timestamp}_{detection_num}.png"
+                shutil.copy2(screenshot_path, dest_path)
+                screenshot_file_map[idx] = dest_path.name
+                saved_count += 1
+        
+        print(f"  ✅ Saved {saved_count} screenshot(s) with detections to {screenshots_dir.name}/")
+        
+        # Update detected_types with actual filenames
+        for msg_type in detected_types:
+            if detected_types[msg_type]['screenshot_idx'] is not None:
+                idx = detected_types[msg_type]['screenshot_idx']
+                detected_types[msg_type]['screenshot'] = screenshot_file_map.get(idx)
+    elif screenshot_paths:
+        print(f"\n⚠️  Found {len(screenshot_paths)} screenshot(s) but no harmful content detections")
+    else:
+        print(f"\n⚠️  No screenshots found in history")
     
     # Print concise, demo-friendly summary
     print("\n" + "="*60)

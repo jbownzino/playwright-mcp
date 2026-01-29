@@ -163,8 +163,9 @@ export class Game extends Scene
 
     scheduleNextHarmfulContent ()
     {
-        // Randomize when next harmful content modal appears (between 1 and 2 shots for faster demo)
-        const modalTriggerShot = Phaser.Math.Between(1, 2);
+        // Randomize when next harmful content modal appears (between 1 and 3 shots)
+        // This ensures there's spacing between modals (up to 2 shots between)
+        const modalTriggerShot = Phaser.Math.Between(1, 3);
         this.registry.set('harmfulContentModalShot', modalTriggerShot);
         const harmfulCount = this.registry.get('harmfulContentShown');
         console.log(`Harmful content modal #${harmfulCount + 1} will appear after ${modalTriggerShot} shot(s)`);
