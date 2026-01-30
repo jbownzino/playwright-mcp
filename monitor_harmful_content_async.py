@@ -2,8 +2,9 @@
 """
 Harmful Content Detection Monitor (Async Mode)
 
-Option B: Separate "player" (fast repeated shots) and "detector" (screenshot + LLM + close modal).
-Shots happen at a realistic rate; detection runs in parallel. Summary at the end.
+Supports two modes (env USE_LLM_GAMEPLAY):
+- USE_LLM_GAMEPLAY=true: LLM-driven gameplay. Read game code → generate play instructions → LLM decides each action (click/wait) and detects harmful modals from screenshots. Works for any game by reading its source.
+- Default: Separate player (fast clicks) + detector (screenshot → LLM). Keeps current behavior.
 """
 import os
 import sys
@@ -31,10 +32,13 @@ env_path = script_dir / ".env"
 load_dotenv(dotenv_path=env_path)
 
 GAME_URL = "http://localhost:8080"
+# Path to game source for LLM-driven mode (read code to generate play instructions). Can override with env.
+GAME_SOURCE_PATH = os.getenv("GAME_SOURCE_PATH") or str(script_dir / "template-youtube-playables" / "src")
+USE_LLM_GAMEPLAY = os.getenv("USE_LLM_GAMEPLAY", "false").lower() == "true"
 
-# Timing: less space between shots = more realistic gameplay
+# Timing
 SHOT_INTERVAL_SEC = 3
-DETECTOR_INTERVAL_SEC = 2
+DETECTOR_INTERVAL_SEC = 1.2
 DETECTOR_TIMEOUT_SEC = 120
 GAME_LOAD_WAIT_SEC = 3.5
 START_CLICK_WAIT_SEC = 1.5
@@ -68,6 +72,226 @@ async def check_game_server():
                 return resp.status == 200
     except Exception:
         return False
+
+
+# --- LLM-driven gameplay: read game code and generate play instructions ---
+
+def read_game_source(source_path: str) -> str:
+    """Read game source code so the LLM can generate play instructions. Works for any game path."""
+    root = Path(source_path)
+    if not root.exists():
+        return ""
+    parts = []
+    # Scenes and main entry
+    for pattern in ("scenes/*.js", "*.js", "gameobjects/*.js"):
+        for f in sorted(root.glob(pattern)):
+            if f.is_file():
+                try:
+                    parts.append(f"// --- {f.relative_to(root)} ---\n{f.read_text(encoding='utf-8', errors='replace')}")
+                except Exception:
+                    pass
+    return "\n\n".join(parts) if parts else ""
+
+
+PLAY_INSTRUCTIONS_PROMPT = """You are analyzing game source code to produce instructions for an automated player.
+
+Given the game code below (e.g. Phaser, Unity, or other engine), output exactly one JSON object (no other text) with:
+
+{
+  "start_instruction": "How to start the game from the first screen (e.g. 'Click anywhere on the main menu' or 'Click the Start button at center'). Be specific about what to click if the code shows it.",
+  "play_instruction": "How to perform the main gameplay action (e.g. 'Click on the game area to shoot/throw; repeat to keep playing'). Describe what interaction triggers the primary action.",
+  "modal_description": "If the code shows popups/modals (e.g. harmful content warnings), describe what they look like and how to close them (e.g. 'Modal with Close button at bottom center'). If none, say 'No modals in code'."
+}
+
+Use only information from the code. Be concise. Reply with exactly one JSON object."""
+
+
+async def generate_play_instructions(llm, game_code: str, game_url: str) -> dict:
+    """Generate how-to-play instructions from game source so the LLM can drive gameplay. No hardcoded rules."""
+    if not game_code.strip():
+        return {
+            "start_instruction": "Click in the center of the screen to start.",
+            "play_instruction": "Click on the game area to perform the main action; repeat as needed.",
+            "modal_description": "If a modal appears with a Close button, click it to dismiss.",
+        }
+    prompt = f"Game URL: {game_url}\n\nGame source code:\n{game_code[:30000]}\n\n{PLAY_INSTRUCTIONS_PROMPT}"
+    try:
+        response = await asyncio.wait_for(llm.ainvoke([UserMessage(content=prompt)]), timeout=30.0)
+        text = (response.completion or "").strip()
+        if "```" in text:
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start >= 0 and end > start:
+                text = text[start:end]
+        return json.loads(text)
+    except Exception:
+        return {
+            "start_instruction": "Click in the center of the screen to start.",
+            "play_instruction": "Click on the game area to perform the main action; repeat as needed.",
+            "modal_description": "If a modal appears with a Close button, click it to dismiss.",
+        }
+
+
+UNIFIED_STEP_PROMPT = """You are controlling the game and detecting harmful content. You have play instructions (from analyzing the game code) and the current screenshot.
+
+Viewport size: {viewport_w} x {viewport_h} pixels. Use pixel coordinates for clicks (origin top-left).
+
+Play instructions (from game code):
+- Start: {start_instruction}
+- Play: {play_instruction}
+- Modals: {modal_description}
+
+Task: (1) If the game is not started yet, perform the start action. (2) Otherwise perform the main play action (e.g. shoot) so the game progresses. (3) If you see a harmful content modal (overlay with warning/Close button and harmful text), report it and say where to click to close it.
+
+Detected so far: {detected_summary}
+
+Respond with exactly one JSON object (no other text):
+{{
+  "action": "click" | "wait" | "done",
+  "x": number (pixel, required for click),
+  "y": number (pixel, required for click),
+  "wait_seconds": number (optional, for wait),
+  "has_modal": boolean,
+  "modal_type": "violence" | "drugs" | "sexual" | null,
+  "modal_text": "exact text in modal if has_modal",
+  "why_harmful": "one sentence if has_modal",
+  "content_type_label": "Violence/weapons" | "Drug promotion" | "Sexual/inappropriate" | null,
+  "semantic_understanding": "one sentence if has_modal",
+  "close_x": number (pixel to click to close modal, if has_modal),
+  "close_y": number (pixel to click to close modal, if has_modal)
+}}
+
+Rules: If you see a harmful modal, set has_modal true and give modal_type/modal_text/close_x/close_y. For action use "click" with (x,y) to start or to play (e.g. shoot). Use "wait" only briefly if needed. Use "done" only when all 3 harmful types are detected. Reply with exactly one JSON object."""
+
+
+async def llm_driven_gameplay_loop(
+    browser,
+    llm,
+    play_instructions: dict,
+    detected_types: dict,
+    detections_list: list,
+    stop_event: asyncio.Event,
+):
+    """Single loop: LLM sees screenshot + play instructions, returns next action and optional harmful-modal detection. No hardcoded gameplay."""
+    step = 0
+    vw, vh = 1280, 720
+    close_x, close_y = None, None
+
+    try:
+        while not stop_event.is_set():
+            if all(detected_types.values()):
+                print("  👁️ All 3 types found.", flush=True)
+                break
+            try:
+                page = await browser.get_current_page()
+                if not page:
+                    break
+                vp_str = await page.evaluate("() => ({ w: window.innerWidth, h: window.innerHeight })")
+                vw, vh = parse_viewport(vp_str)
+                if close_x is None:
+                    close_x, close_y = vw // 2, vh // 2 + 100
+
+                step += 1
+                print(f"  🎮 Step {step} (LLM gameplay + detection)...", flush=True)
+
+                screenshot_b64 = await page.screenshot(format="png")
+                data_url = f"data:image/png;base64,{screenshot_b64}"
+                detected_names = [TYPE_LABELS[k] for k, v in detected_types.items() if v]
+                detected_summary = ", ".join(detected_names) if detected_names else "None yet"
+
+                prompt = UNIFIED_STEP_PROMPT.format(
+                    viewport_w=vw,
+                    viewport_h=vh,
+                    start_instruction=play_instructions.get("start_instruction", "Click center to start."),
+                    play_instruction=play_instructions.get("play_instruction", "Click game area to play."),
+                    modal_description=play_instructions.get("modal_description", "Modal with Close button."),
+                    detected_summary=detected_summary,
+                )
+                user_msg = UserMessage(
+                    content=[
+                        ContentPartTextParam(text=prompt),
+                        ContentPartImageParam(image_url=ImageURL(url=data_url, media_type="image/png")),
+                    ]
+                )
+                response = await asyncio.wait_for(llm.ainvoke([user_msg]), timeout=25.0)
+                text = (response.completion or "").strip()
+                if "```" in text:
+                    start = text.find("{")
+                    end = text.rfind("}") + 1
+                    if start >= 0 and end > start:
+                        text = text[start:end]
+                data = json.loads(text)
+
+                # Execute action (LLM-driven)
+                action = (data.get("action") or "click").lower()
+                if action == "click":
+                    x = int(data.get("x", vw // 2))
+                    y = int(data.get("y", vh // 2))
+                    mouse = await page.mouse
+                    await mouse.click(max(0, min(x, vw)), max(0, min(y, vh)))
+                    print(f"     Clicked ({x}, {y})", flush=True)
+                elif action == "wait":
+                    sec = float(data.get("wait_seconds", 1.0))
+                    await asyncio.sleep(min(sec, 3.0))
+                elif action == "done":
+                    break
+
+                # Handle harmful modal detection (from same LLM response)
+                if data.get("has_modal"):
+                    content_type = (data.get("modal_type") or "").lower().strip()
+                    if content_type not in ("violence", "drugs", "sexual"):
+                        content_type = "violence"
+                    cx, cy = data.get("close_x"), data.get("close_y")
+                    if cx is not None and cy is not None:
+                        close_x, close_y = int(cx), int(cy)
+                    is_new_type = not detected_types.get(content_type)
+                    if is_new_type:
+                        rec = {
+                            "type": content_type,
+                            "at": datetime.now().isoformat(),
+                            "modal_text": (data.get("modal_text") or "").strip() or CANONICAL_MESSAGES.get(content_type, ""),
+                            "why_harmful": data.get("why_harmful") or "",
+                            "content_type_label": data.get("content_type_label") or TYPE_LABELS.get(content_type, ""),
+                            "semantic_understanding": data.get("semantic_understanding") or "",
+                        }
+                        detected_types[content_type] = True
+                        detections_list.append(rec)
+                        screenshots_dir = script_dir / "screenshots"
+                        screenshots_dir.mkdir(exist_ok=True)
+                        try:
+                            sp = screenshots_dir / f"harmful_content_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{len(detections_list)}.png"
+                            sp.write_bytes(base64.b64decode(screenshot_b64))
+                            rec["screenshot_path"] = str(sp)
+                            print(f"     📸 Saved screenshot: {sp.name}", flush=True)
+                        except Exception:
+                            pass
+                        print("", flush=True)
+                        print(_format_detection_block(rec), flush=True)
+                        print("", flush=True)
+                        n = sum(1 for v in detected_types.values() if v)
+                        _step_log(step, f"Detected {content_type}; closing modal.", memory=f"{n}/3 detected.", next_goal="Continue play." if n < 3 else "Done.")
+                    else:
+                        n = sum(1 for v in detected_types.values() if v)
+                        _step_log(step, f"Modal ({content_type}) already counted; closing.", memory=f"{n}/3 detected.", next_goal="Continue play.")
+                    mouse = await page.mouse
+                    await mouse.click(close_x, close_y)
+                    print(f"     ✓ Clicked Close.", flush=True)
+                    await asyncio.sleep(1.0)
+                else:
+                    _step_log(step, "No modal; performed play action.", next_goal="Continue until modal or done.")
+
+            except asyncio.TimeoutError:
+                _step_log(step, "LLM timeout.", next_goal="Retry.")
+            except json.JSONDecodeError:
+                _step_log(step, "Could not parse LLM response.", next_goal="Retry.")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                _step_log(step, f"Error: {e}", next_goal="Retry.")
+
+            await asyncio.sleep(DETECTOR_INTERVAL_SEC)
+    except asyncio.CancelledError:
+        pass
 
 
 async def player_loop(browser, viewport_center_x: int, viewport_center_y: int, stop_event: asyncio.Event):
@@ -108,7 +332,7 @@ def parse_viewport(s: str) -> tuple[int, int]:
         return 1280, 720
 
 
-# Canonical modal messages (match Game.js) for final result summary
+# Display only (final result summary, labels) — not used for detection; detection is LLM-from-screenshot only
 CANONICAL_MESSAGES = {
     "violence": "Go grab the gun, now! You know what to do.",
     "drugs": "Let's go get some drugs",
@@ -257,17 +481,11 @@ async def detector_loop(
                     await asyncio.sleep(DETECTOR_INTERVAL_SEC)
                     continue
 
-                content_type = (data.get("type") or "").lower()
-                # Normalize LLM response to one of the three categories (semantic, no keyword rules)
+                # Use LLM classification only — no keyword or hardcoded rules; detection is purely semantic from screenshot
+                content_type = (data.get("type") or "").lower().strip()
                 if content_type not in ("violence", "drugs", "sexual"):
-                    if "violence" in content_type or "weapon" in content_type:
-                        content_type = "violence"
-                    elif "drug" in content_type:
-                        content_type = "drugs"
-                    elif "sexual" in content_type or "inappropriate" in content_type:
-                        content_type = "sexual"
-                    else:
-                        content_type = "violence"  # fallback only when LLM returns something else
+                    # LLM returned something else; use generic fallback so we don't drop the detection (no keyword mapping)
+                    content_type = "violence"
 
                 modal_text_raw = (data.get("modal_text") or "").strip()
                 rec = {
@@ -378,50 +596,69 @@ async def run_async():
         await asyncio.sleep(GAME_LOAD_WAIT_SEC)
         print("✅ Game loaded.", flush=True)
 
-        vp_str = await page.evaluate("() => ({ w: window.innerWidth, h: window.innerHeight })")
-        vw, vh = parse_viewport(vp_str)
-        center_x, center_y = vw // 2, vh // 2
-
-        # Start game (main menu: any click starts)
-        print("🖱️ Clicking to start game...", flush=True)
-        mouse = await page.mouse
-        await mouse.click(center_x, center_y)
-        await asyncio.sleep(START_CLICK_WAIT_SEC)
-        print("✅ Game started. Starting player (shots) + detector (modal check).", flush=True)
-        print("-" * 50, flush=True)
-
         detected_types = {"violence": False, "drugs": False, "sexual": False}
         detections_list = []
         stop_event = asyncio.Event()
-
         llm = ChatGoogle(model="gemini-flash-latest")
-        player = asyncio.create_task(
-            player_loop(browser, center_x, center_y, stop_event)
-        )
-        detector = asyncio.create_task(
-            detector_loop(browser, llm, detected_types, detections_list, stop_event)
-        )
 
-        # Run until all 3 detected or timeout
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(detector),
-                timeout=DETECTOR_TIMEOUT_SEC,
+        if USE_LLM_GAMEPLAY:
+            # LLM-driven gameplay: read game code → generate play instructions → LLM decides each action
+            print("📖 Reading game source to generate play instructions...", flush=True)
+            game_code = read_game_source(GAME_SOURCE_PATH)
+            if game_code:
+                print(f"   Read {len(game_code)} chars from {GAME_SOURCE_PATH}", flush=True)
+            else:
+                print(f"   No source at {GAME_SOURCE_PATH}; using default instructions.", flush=True)
+            play_instructions = await generate_play_instructions(llm, game_code, GAME_URL)
+            print("   Play instructions (from LLM):", flush=True)
+            for k, v in play_instructions.items():
+                print(f"     {k}: {str(v)[:80]}...", flush=True)
+            print("-" * 50, flush=True)
+            gameplay = asyncio.create_task(
+                llm_driven_gameplay_loop(browser, llm, play_instructions, detected_types, detections_list, stop_event)
             )
-        except asyncio.TimeoutError:
-            print("\n⏱️ Detector timeout reached.", flush=True)
-        finally:
-            stop_event.set()
-            player.cancel()
             try:
-                await player
-            except asyncio.CancelledError:
-                pass
-            detector.cancel()
+                await asyncio.wait_for(asyncio.shield(gameplay), timeout=DETECTOR_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                print("\n⏱️ Timeout reached.", flush=True)
+            finally:
+                stop_event.set()
+                gameplay.cancel()
+                try:
+                    await gameplay
+                except asyncio.CancelledError:
+                    pass
+        else:
+            # Original: hardcoded start + player loop + detector loop
+            vp_str = await page.evaluate("() => ({ w: window.innerWidth, h: window.innerHeight })")
+            vw, vh = parse_viewport(vp_str)
+            center_x, center_y = vw // 2, vh // 2
+            print("🖱️ Clicking to start game...", flush=True)
+            mouse = await page.mouse
+            await mouse.click(center_x, center_y)
+            await asyncio.sleep(START_CLICK_WAIT_SEC)
+            print("✅ Game started. Starting player (shots) + detector (modal check).", flush=True)
+            print("-" * 50, flush=True)
+            player = asyncio.create_task(player_loop(browser, center_x, center_y, stop_event))
+            detector = asyncio.create_task(
+                detector_loop(browser, llm, detected_types, detections_list, stop_event)
+            )
             try:
-                await detector
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(asyncio.shield(detector), timeout=DETECTOR_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                print("\n⏱️ Detector timeout reached.", flush=True)
+            finally:
+                stop_event.set()
+                player.cancel()
+                try:
+                    await player
+                except asyncio.CancelledError:
+                    pass
+                detector.cancel()
+                try:
+                    await detector
+                except asyncio.CancelledError:
+                    pass
 
         print("-" * 50, flush=True)
         # Final result summary

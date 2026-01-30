@@ -86,6 +86,25 @@ python monitor_harmful_content_async.py
 
 Tunables at the top of `monitor_harmful_content_async.py`: `SHOT_INTERVAL_SEC`, `DETECTOR_INTERVAL_SEC`, `DETECTOR_TIMEOUT_SEC`.
 
+### LLM-driven gameplay (works for any game)
+
+Set `USE_LLM_GAMEPLAY=true` so the LLM drives gameplay from the game’s source code:
+
+1. **Read game code** from `GAME_SOURCE_PATH` (default: `template-youtube-playables/src` — scenes and main JS).
+2. **Generate play instructions**: one LLM call with the code returns `start_instruction`, `play_instruction`, `modal_description` (how to start, how to play, how modals look and how to close them).
+3. **Unified loop**: each step the LLM gets the current screenshot + play instructions + viewport size + “detected so far”. It returns the next action (`click` x,y or `wait`) and, if it sees a harmful modal, `has_modal` + type + `close_x`/`close_y`. We execute the action and, when a modal is reported, record the detection and click Close.
+
+No hardcoded “click center to start” or “click to shoot” — the same script can be pointed at another game by setting `GAME_SOURCE_PATH` to that game’s source; the LLM infers how to play from the code.
+
+```bash
+# In .env:
+USE_LLM_GAMEPLAY=true
+# Optional: path to game source (default: template-youtube-playables/src)
+# GAME_SOURCE_PATH=path/to/your/game/src
+
+python monitor_harmful_content_async.py
+```
+
 ## What Happens
 
 1. **Game Starts**: Browser-Use navigates to http://localhost:8080
