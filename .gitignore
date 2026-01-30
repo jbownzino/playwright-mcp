@@ -17,7 +17,7 @@ sdist/
 var/
 wheels/
 *.egg-info/
-.installed.cfg
+.installed.cfg1
 *.egg
 .chrome-debug-profile/*
 .chrome-debug-profile

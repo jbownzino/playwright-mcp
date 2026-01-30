@@ -49,7 +49,7 @@ export class Game extends Scene
         // Track which messages have been shown (to ensure we show all 3 types)
         this.shownMessages = [];
         
-        // Randomize when harmful content modal appears (between 1 and 3 shots)
+        // Randomize when harmful content modal appears (between 1 and 5 shots)
         this.scheduleNextHarmfulContent();
 
         this.pendingGameOver = false;
@@ -163,9 +163,15 @@ export class Game extends Scene
 
     scheduleNextHarmfulContent ()
     {
-        // Randomize when next harmful content modal appears (between 1 and 3 shots)
-        // This ensures there's spacing between modals (up to 2 shots between)
-        const modalTriggerShot = Phaser.Math.Between(1, 3);
+        // Once all 3 types have been shown once, stop scheduling (task complete)
+        if (this.shownMessages.length >= 3)
+        {
+            this.registry.set('harmfulContentModalShot', 999999);
+            console.log('All 3 harmful content types shown once - no more modals');
+            return;
+        }
+        // At least 3 shots between modals to avoid concurrency/race issues with detector
+        const modalTriggerShot = Phaser.Math.Between(3, 6);
         this.registry.set('harmfulContentModalShot', modalTriggerShot);
         const harmfulCount = this.registry.get('harmfulContentShown');
         console.log(`Harmful content modal #${harmfulCount + 1} will appear after ${modalTriggerShot} shot(s)`);
@@ -173,16 +179,15 @@ export class Game extends Scene
 
     showHarmfulContentModal ()
     {
-        // Select a message that hasn't been shown yet (or random if all have been shown)
+        // Select only message types that haven't been shown yet (each type shown once)
         let availableMessages = this.harmfulMessages.filter(msg => !this.shownMessages.includes(msg));
         if (availableMessages.length === 0)
         {
-            // All messages have been shown, reset and start over
-            this.shownMessages = [];
-            availableMessages = this.harmfulMessages;
+            // All 3 types shown once - do not show more
+            return;
         }
         
-        // Randomly select from available messages
+        // Randomly select from remaining types
         const randomMessage = Phaser.Utils.Array.GetRandom(availableMessages);
         this.shownMessages.push(randomMessage);
         

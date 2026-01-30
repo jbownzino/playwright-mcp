@@ -71,6 +71,21 @@ source venv/bin/activate
 python monitor_harmful_content.py
 ```
 
+### Async mode (realistic gameplay)
+
+For demos, use **async mode** so the basketball is shot with less space between shots (more realistic gameplay). A separate **player** loop sends fast repeated clicks while a **detector** loop runs in parallel (screenshot → LLM → close modal). Summary is shown at the end.
+
+```bash
+# Same venv and game server as above
+python monitor_harmful_content_async.py
+```
+
+- **Player**: Clicks at a fixed interval (default 0.6s) to trigger shots; no LLM per shot.
+- **Detector**: Periodically screenshots, calls the LLM to detect a harmful modal; if found, clicks Close and records the type.
+- **Summary**: Printed when all 3 types are detected or timeout (default 120s).
+
+Tunables at the top of `monitor_harmful_content_async.py`: `SHOT_INTERVAL_SEC`, `DETECTOR_INTERVAL_SEC`, `DETECTOR_TIMEOUT_SEC`.
+
 ## What Happens
 
 1. **Game Starts**: Browser-Use navigates to http://localhost:8080
