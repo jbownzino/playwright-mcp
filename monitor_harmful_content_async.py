@@ -13,6 +13,7 @@ import time
 import base64
 import asyncio
 import logging
+import ast
 from pathlib import Path
 from datetime import datetime
 
@@ -163,6 +164,95 @@ Respond with exactly one JSON object (no other text):
 
 Rules: If you see a harmful modal, set has_modal true and give modal_type/modal_text/close_x/close_y. For action use "click" with (x,y) to start or to play (e.g. shoot). Use "wait" only briefly if needed. Use "done" only when all 3 harmful types are detected. Reply with exactly one JSON object."""
 
+GAMEPLAY_ONLY_PROMPT = """You are controlling a game from a screenshot using play instructions derived from the game source code.
+
+Viewport size: {viewport_w} x {viewport_h} pixels. Use pixel coordinates for clicks (origin top-left).
+
+Play instructions (from game code):
+- Start: {start_instruction}
+- Play: {play_instruction}
+- Modals: {modal_description}
+
+Task: Start the game if needed, then perform the main play action repeatedly to progress the game.
+
+CRITICAL: If you see ANY modal overlay (especially a harmful-content warning modal with a Close button), DO NOT click anything. Respond with action "wait" and wait_seconds=0.6 so a separate detector can handle it.
+
+Respond with exactly one JSON object (no other text):
+{{
+  "action": "click" | "wait" | "done",
+  "x": number (pixel, required for click),
+  "y": number (pixel, required for click),
+  "wait_seconds": number (optional, for wait)
+}}"""
+
+
+async def llm_gameplay_only_loop(
+    page,
+    llm,
+    play_instructions: dict,
+    stop_event: asyncio.Event,
+    modal_open_event: asyncio.Event,
+):
+    """
+    LLM-driven gameplay loop ONLY.
+
+    - Gameplay rules are semantically generated from source (play_instructions).
+    - Harmful-content detection is handled by detector_loop (computer vision prompt).
+    """
+    step = 0
+    vw, vh = 1280, 720
+    try:
+        while not stop_event.is_set():
+            # If the detector believes a modal is open, pause to avoid closing it without counting.
+            if modal_open_event.is_set():
+                await asyncio.sleep(0.2)
+                continue
+
+            vp = await page.evaluate("() => ({ w: window.innerWidth, h: window.innerHeight })")
+            vw, vh = parse_viewport(vp)
+
+            step += 1
+            print(f"  🎮 Step {step} (LLM gameplay only)...", flush=True)
+
+            screenshot_b64 = await page.screenshot(format="png")
+            data_url = f"data:image/png;base64,{screenshot_b64}"
+
+            prompt = GAMEPLAY_ONLY_PROMPT.format(
+                viewport_w=vw,
+                viewport_h=vh,
+                start_instruction=play_instructions.get("start_instruction", "Click center to start."),
+                play_instruction=play_instructions.get("play_instruction", "Click game area to play."),
+                modal_description=play_instructions.get("modal_description", "Modal with Close button."),
+            )
+
+            user_msg = UserMessage(
+                content=[
+                    ContentPartTextParam(text=prompt),
+                    ContentPartImageParam(image_url=ImageURL(url=data_url, media_type="image/png")),
+                ]
+            )
+
+            response = await asyncio.wait_for(llm.ainvoke([user_msg]), timeout=20.0)
+            text = (response.completion or "").strip()
+            data = _parse_json_lenient(text)
+
+            action = (data.get("action") or "click").lower()
+            if action == "wait":
+                sec = float(data.get("wait_seconds", 0.6))
+                await asyncio.sleep(min(sec, 2.0))
+            elif action == "done":
+                break
+            else:
+                x = int(data.get("x", vw // 2))
+                y = int(data.get("y", vh // 2))
+                mouse = await page.mouse
+                await mouse.click(max(0, min(x, vw)), max(0, min(y, vh)))
+                print(f"     Clicked ({x}, {y})", flush=True)
+
+            await asyncio.sleep(0.2)
+    except asyncio.CancelledError:
+        pass
+
 
 async def llm_driven_gameplay_loop(
     browser,
@@ -220,39 +310,68 @@ async def llm_driven_gameplay_loop(
                     end = text.rfind("}") + 1
                     if start >= 0 and end > start:
                         text = text[start:end]
-                data = json.loads(text)
+                data = _parse_json_lenient(text)
 
-                # Execute action (LLM-driven)
-                action = (data.get("action") or "click").lower()
-                if action == "click":
-                    x = int(data.get("x", vw // 2))
-                    y = int(data.get("y", vh // 2))
-                    mouse = await page.mouse
-                    await mouse.click(max(0, min(x, vw)), max(0, min(y, vh)))
-                    print(f"     Clicked ({x}, {y})", flush=True)
-                elif action == "wait":
-                    sec = float(data.get("wait_seconds", 1.0))
-                    await asyncio.sleep(min(sec, 3.0))
-                elif action == "done":
-                    break
+                # Determine if a modal is present.
+                # Primary: unified gameplay response. Fallback: strict detector on the SAME screenshot.
+                modal_data = data if data.get("has_modal") else None
+                if not modal_data:
+                    modal_data = await _detect_modal_from_screenshot(llm, screenshot_b64, detected_types)
+                    if modal_data:
+                        print("     🔁 Fallback detector: modal found (unified step missed it).", flush=True)
+                    else:
+                        # If we're stuck on the final remaining type, save a debug screenshot so we can inspect
+                        # what the model is seeing when it claims "no modal".
+                        remaining_one = _only_remaining_type(detected_types)
+                        if remaining_one:
+                            try:
+                                screenshots_dir = script_dir / "screenshots"
+                                screenshots_dir.mkdir(exist_ok=True)
+                                sp = screenshots_dir / f"debug_missed_{remaining_one}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_step{step}.png"
+                                sp.write_bytes(base64.b64decode(screenshot_b64))
+                                print(f"     🐞 Saved debug screenshot: {screenshots_dir.name}/{sp.name}", flush=True)
+                            except Exception:
+                                pass
 
-                # Handle harmful modal detection (from same LLM response)
-                if data.get("has_modal"):
-                    content_type = (data.get("modal_type") or "").lower().strip()
-                    if content_type not in ("violence", "drugs", "sexual"):
+                # If a modal is present, prioritize counting + closing it before any gameplay clicks.
+                if modal_data:
+                    content_type = _normalize_content_type(
+                        raw_type=modal_data.get("modal_type") or modal_data.get("type"),
+                        raw_label=modal_data.get("content_type_label"),
+                        raw_text=modal_data.get("modal_text"),
+                        detected_types=detected_types,
+                    )
+                    if not content_type:
                         content_type = "violence"
-                    cx, cy = data.get("close_x"), data.get("close_y")
+
+                    remaining_one = _only_remaining_type(detected_types)
+                    if remaining_one and detected_types.get(content_type) and remaining_one != content_type:
+                        # Misclassification is common in unified mode; confirm with strict detector.
+                        strict = await _detect_modal_from_screenshot(llm, screenshot_b64, detected_types)
+                        if strict:
+                            strict_type = _normalize_content_type(
+                                raw_type=strict.get("type") or strict.get("modal_type"),
+                                raw_label=strict.get("content_type_label"),
+                                raw_text=strict.get("modal_text"),
+                                detected_types=detected_types,
+                            )
+                            if strict_type:
+                                content_type = strict_type
+
+                    cx, cy = modal_data.get("close_x"), modal_data.get("close_y")
                     if cx is not None and cy is not None:
                         close_x, close_y = int(cx), int(cy)
+
                     is_new_type = not detected_types.get(content_type)
                     if is_new_type:
                         rec = {
                             "type": content_type,
                             "at": datetime.now().isoformat(),
-                            "modal_text": (data.get("modal_text") or "").strip() or CANONICAL_MESSAGES.get(content_type, ""),
-                            "why_harmful": data.get("why_harmful") or "",
-                            "content_type_label": data.get("content_type_label") or TYPE_LABELS.get(content_type, ""),
-                            "semantic_understanding": data.get("semantic_understanding") or "",
+                            "modal_text": (modal_data.get("modal_text") or "").strip()
+                            or CANONICAL_MESSAGES.get(content_type, ""),
+                            "why_harmful": modal_data.get("why_harmful") or "",
+                            "content_type_label": modal_data.get("content_type_label") or TYPE_LABELS.get(content_type, ""),
+                            "semantic_understanding": modal_data.get("semantic_understanding") or "",
                         }
                         detected_types[content_type] = True
                         detections_list.append(rec)
@@ -269,16 +388,48 @@ async def llm_driven_gameplay_loop(
                         print(_format_detection_block(rec), flush=True)
                         print("", flush=True)
                         n = sum(1 for v in detected_types.values() if v)
-                        _step_log(step, f"Detected {content_type}; closing modal.", memory=f"{n}/3 detected.", next_goal="Continue play." if n < 3 else "Done.")
+                        _step_log(
+                            step,
+                            f"Detected {content_type}; closing modal.",
+                            memory=f"{n}/3 detected.",
+                            next_goal="Continue play." if n < 3 else "Done.",
+                        )
                     else:
                         n = sum(1 for v in detected_types.values() if v)
                         _step_log(step, f"Modal ({content_type}) already counted; closing.", memory=f"{n}/3 detected.", next_goal="Continue play.")
+
                     mouse = await page.mouse
                     await mouse.click(close_x, close_y)
                     print(f"     ✓ Clicked Close.", flush=True)
                     await asyncio.sleep(1.0)
-                else:
-                    _step_log(step, "No modal; performed play action.", next_goal="Continue until modal or done.")
+                    continue
+
+                # No modal: Execute action (LLM-driven)
+                action = (data.get("action") or "click").lower()
+                if action == "click":
+                    x = int(data.get("x", vw // 2))
+                    y = int(data.get("y", vh // 2))
+                    # If the model is trying to click near the Close button while saying "no modal",
+                    # do a quick recheck to avoid dismissing a modal without counting it.
+                    if _looks_like_close_click(x, y, close_x, close_y):
+                        await asyncio.sleep(0.15)
+                        screenshot2_b64 = await page.screenshot(format="png")
+                        strict2 = await _detect_modal_from_screenshot(llm, screenshot2_b64, detected_types)
+                        if strict2:
+                            print("     🔎 Pre-click recheck: modal found near Close region.", flush=True)
+                            await asyncio.sleep(0.05)
+                            continue
+                        # No modal after recheck: nudge the click away from Close region.
+                        y = min(y, max(0, (vh // 2) - 40))
+                    mouse = await page.mouse
+                    await mouse.click(max(0, min(x, vw)), max(0, min(y, vh)))
+                    print(f"     Clicked ({x}, {y})", flush=True)
+                elif action == "wait":
+                    sec = float(data.get("wait_seconds", 1.0))
+                    await asyncio.sleep(min(sec, 3.0))
+                elif action == "done":
+                    break
+                _step_log(step, "No modal; performed play action.", next_goal="Continue until modal or done.")
 
             except asyncio.TimeoutError:
                 _step_log(step, "LLM timeout.", next_goal="Retry.")
@@ -323,12 +474,15 @@ async def player_loop(browser, viewport_center_x: int, viewport_center_y: int, s
         pass
 
 
-def parse_viewport(s: str) -> tuple[int, int]:
+def parse_viewport(vp) -> tuple[int, int]:
     """Parse viewport from page.evaluate('() => ({ w: window.innerWidth, h: window.innerHeight })')."""
     try:
-        data = json.loads(s)
+        if isinstance(vp, dict):
+            data = vp
+        else:
+            data = json.loads(vp)
         return int(data.get("w", 1280)), int(data.get("h", 720))
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
         return 1280, 720
 
 
@@ -343,6 +497,137 @@ TYPE_LABELS = {
     "drugs": "Drug promotion",
     "sexual": "Sexual/inappropriate",
 }
+
+
+def _normalize_content_type(
+    raw_type: str | None,
+    raw_label: str | None,
+    raw_text: str | None,
+    detected_types: dict | None = None,
+) -> str | None:
+    """
+    Normalize LLM-returned type/label/text into one of: violence, drugs, sexual.
+
+    Fixes a common failure mode where the LLM returns values like "Sexual/inappropriate"
+    or "Drug promotion" and the code incorrectly falls back to an already-detected type,
+    causing the *third* modal to never be counted.
+    """
+    rt = (raw_type or "").strip().lower()
+    rl = (raw_label or "").strip().lower()
+    txt = (raw_text or "").strip().lower()
+
+    # Direct matches / common variants
+    if rt in ("violence", "drugs", "sexual"):
+        return rt
+    if rt in ("drug",):
+        return "drugs"
+    if rt in ("violence/weapons", "violence-weapons", "weapons", "weapon", "gun"):
+        return "violence"
+    if rt in ("sexual/inappropriate", "sexual-inappropriate", "inappropriate", "sex", "sexual content"):
+        return "sexual"
+
+    # Substring matches from type + label
+    blob = f"{rt} {rl}"
+    if "drug" in blob:
+        return "drugs"
+    if "sexual" in blob or "inappropriate" in blob:
+        return "sexual"
+    if "violence" in blob or "weapon" in blob or "gun" in blob:
+        return "violence"
+
+    # Last resort: infer from modal text
+    if txt:
+        if any(k in txt for k in ("send me", "photo", "photos", "pics", "nude", "explicit")):
+            return "sexual"
+        if any(k in txt for k in ("drug", "drugs", "weed", "cocaine", "heroin", "meth", "pills")):
+            return "drugs"
+        if any(k in txt for k in ("gun", "weapon", "knife", "kill", "shoot")):
+            return "violence"
+
+    # If exactly one remaining, assume it (only when we've already detected 2/3)
+    if detected_types:
+        remaining = [k for k, v in detected_types.items() if not v]
+        if len(remaining) == 1:
+            return remaining[0]
+
+    return None
+
+
+def _only_remaining_type(detected_types: dict) -> str | None:
+    remaining = [k for k, v in detected_types.items() if not v]
+    return remaining[0] if len(remaining) == 1 else None
+
+
+def _near(a: int, b: int, tol: int) -> bool:
+    return abs(int(a) - int(b)) <= tol
+
+
+def _looks_like_close_click(x: int, y: int, close_x: int | None, close_y: int | None) -> bool:
+    """
+    Heuristic: if the LLM is about to click near the known Close button location
+    while claiming there is no modal, that click risks dismissing a modal without
+    counting it.
+    """
+    if close_x is None or close_y is None:
+        return False
+    return _near(x, close_x, tol=70) and _near(y, close_y, tol=50)
+
+
+def _extract_json_object(text: str) -> str | None:
+    """
+    Extract the first balanced {...} JSON object substring from a model response.
+    Handles markdown fences and extra prose/safety text.
+    """
+    if not text:
+        return None
+    t = text.strip()
+    if "```" in t:
+        start = t.find("{")
+        end = t.rfind("}") + 1
+        if start >= 0 and end > start:
+            t = t[start:end]
+
+    start = t.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(t)):
+        ch = t[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return t[start : i + 1]
+    return None
+
+
+def _parse_json_lenient(text: str) -> dict:
+    """
+    Parse a JSON object from a model response, with fallbacks.
+    """
+    candidate = _extract_json_object(text) or (text or "").strip()
+    try:
+        return json.loads(candidate)
+    except Exception:
+        # Fallback: models sometimes emit Python-ish dicts / single quotes.
+        obj = ast.literal_eval(candidate)
+        if isinstance(obj, dict):
+            return obj
+        raise
 
 
 DETECTION_PROMPT = """You are classifying a game screenshot for harmful content modals.
@@ -366,6 +651,31 @@ If there is no such modal, or the screen shows only normal game play, respond:
 {"has_modal": false}
 
 Reply with exactly one JSON object, nothing else."""
+
+
+async def _detect_modal_from_screenshot(llm, screenshot_b64: str, detected_types: dict) -> dict | None:
+    """
+    Fallback detector used in LLM-driven gameplay mode.
+
+    The unified gameplay prompt can sometimes click/close a modal but fail to set
+    has_modal=true (so we never count the 3rd type). This re-checks the SAME
+    screenshot with a stricter detection-only prompt.
+    """
+    data_url = f"data:image/png;base64,{screenshot_b64}"
+    prompt = _detection_prompt_with_context(detected_types)
+    user_msg = UserMessage(
+        content=[
+            ContentPartTextParam(text=prompt),
+            ContentPartImageParam(image_url=ImageURL(url=data_url, media_type="image/png")),
+        ]
+    )
+    try:
+        response = await asyncio.wait_for(llm.ainvoke([user_msg]), timeout=12.0)
+        text = (response.completion or "").strip()
+        data = _parse_json_lenient(text)
+        return data if data.get("has_modal") else None
+    except Exception:
+        return None
 
 
 def _detection_prompt_with_context(detected_types: dict) -> str:
@@ -416,6 +726,9 @@ async def detector_loop(
     detected_types: dict,
     detections_list: list,
     stop_event: asyncio.Event,
+    *,
+    page=None,
+    modal_open_event: asyncio.Event | None = None,
 ):
     """
     Periodically screenshot, call LLM to detect harmful modal; if found, click Close and record.
@@ -430,7 +743,7 @@ async def detector_loop(
                 print("  👁️ Detector: all 3 types found, stopping checks.", flush=True)
                 break
             try:
-                page = await browser.get_current_page()
+                page = page or await browser.get_current_page()
                 if not page:
                     break
                 # Get viewport for Close button (modal is centered; Close is at center_y + 100)
@@ -466,13 +779,15 @@ async def detector_loop(
                     if start >= 0 and end > start:
                         text = text[start:end]
                 try:
-                    data = json.loads(text)
+                    data = _parse_json_lenient(text)
                 except json.JSONDecodeError:
                     _step_log(step, "Could not parse LLM response as JSON.", next_goal="Retry on next check.")
                     await asyncio.sleep(DETECTOR_INTERVAL_SEC)
                     continue
 
                 if not data.get("has_modal"):
+                    if modal_open_event:
+                        modal_open_event.clear()
                     _step_log(
                         step,
                         "No harmful content modal in screenshot.",
@@ -481,10 +796,18 @@ async def detector_loop(
                     await asyncio.sleep(DETECTOR_INTERVAL_SEC)
                     continue
 
+                if modal_open_event:
+                    modal_open_event.set()
+
                 # Use LLM classification only — no keyword or hardcoded rules; detection is purely semantic from screenshot
-                content_type = (data.get("type") or "").lower().strip()
-                if content_type not in ("violence", "drugs", "sexual"):
-                    # LLM returned something else; use generic fallback so we don't drop the detection (no keyword mapping)
+                content_type = _normalize_content_type(
+                    raw_type=data.get("type"),
+                    raw_label=data.get("content_type_label"),
+                    raw_text=data.get("modal_text"),
+                    detected_types=detected_types,
+                )
+                if not content_type:
+                    # Unknown type; don't crash. We'll still close the modal below.
                     content_type = "violence"
 
                 modal_text_raw = (data.get("modal_text") or "").strip()
@@ -542,6 +865,8 @@ async def detector_loop(
                         print(f"     ⚠️ Close click failed: {e}", flush=True)
                     # Give game time to process close and schedule next modal before next check
                     await asyncio.sleep(1.0)
+                    if modal_open_event:
+                        modal_open_event.clear()
                 else:
                     # Already counted this type (e.g. LLM misclassified); still close so game can progress
                     n = sum(1 for v in detected_types.values() if v)
@@ -558,6 +883,8 @@ async def detector_loop(
                     except Exception:
                         pass
                     await asyncio.sleep(1.0)
+                    if modal_open_event:
+                        modal_open_event.clear()
 
             except asyncio.TimeoutError:
                 _step_log(step, "LLM timeout.", next_goal="Retry on next check.")
@@ -569,6 +896,49 @@ async def detector_loop(
             await asyncio.sleep(DETECTOR_INTERVAL_SEC)
     except asyncio.CancelledError:
         pass
+
+
+async def _activate_page_target_if_possible(browser, page) -> None:
+    """
+    In CDP mode, Chrome focus can remain on an about:blank tab even though we navigate another target.
+    Explicitly activating the target makes the navigated tab visible.
+    """
+    target_id = getattr(page, "_target_id", None)
+    if not target_id:
+        return
+    cdp_client = getattr(browser, "cdp_client", None)
+    if not cdp_client:
+        return
+    try:
+        await cdp_client.send.Target.activateTarget(params={"targetId": target_id})
+    except Exception:
+        # Best-effort: not all browser/session states allow activation.
+        pass
+
+
+async def _focus_page_if_possible(browser, page) -> None:
+    """
+    Prefer switching Browser-Use *agent focus* to the page's target (CDP mode),
+    falling back to plain Target.activateTarget.
+    """
+    target_id = getattr(page, "_target_id", None)
+    if not target_id:
+        return
+
+    # Best option: SwitchTabEvent updates agent focus + activates the tab.
+    event_bus = getattr(browser, "event_bus", None)
+    if event_bus:
+        try:
+            from browser_use.browser.events import SwitchTabEvent
+
+            evt = event_bus.dispatch(SwitchTabEvent(target_id=target_id))
+            await evt
+            return
+        except Exception:
+            pass
+
+    # Fallback: at least try to visually activate the tab.
+    await _activate_page_target_if_possible(browser, page)
 
 
 async def run_async():
@@ -590,9 +960,40 @@ async def run_async():
     print("✅ Browser ready.", flush=True)
 
     try:
-        page = await browser.get_current_page() or await browser.new_page(GAME_URL)
+        # In CDP mode, get_current_page can point at about:blank even if other tabs exist.
+        # Prefer the most-recent existing page, otherwise create one.
+        page = None
+        if use_cdp and hasattr(browser, "get_pages"):
+            try:
+                pages = await browser.get_pages()
+                if pages:
+                    page = pages[-1]
+            except Exception:
+                page = None
+        if not page:
+            page = await browser.get_current_page() or await browser.new_page()
+
+        if use_cdp:
+            await _focus_page_if_possible(browser, page)
+
+        # Debug: show which target/url we're about to drive
+        try:
+            if hasattr(page, "get_url"):
+                print(f"   🔎 Current tab URL before goto: {await page.get_url()}", flush=True)
+        except Exception:
+            pass
+
         print(f"📄 Navigating to {GAME_URL}...", flush=True)
         await page.goto(GAME_URL)
+        if use_cdp:
+            await _focus_page_if_possible(browser, page)
+
+        try:
+            if hasattr(page, "get_url"):
+                print(f"   🔎 Current tab URL after goto:  {await page.get_url()}", flush=True)
+        except Exception:
+            pass
+
         await asyncio.sleep(GAME_LOAD_WAIT_SEC)
         print("✅ Game loaded.", flush=True)
 
@@ -614,18 +1015,35 @@ async def run_async():
             for k, v in play_instructions.items():
                 print(f"     {k}: {str(v)[:80]}...", flush=True)
             print("-" * 50, flush=True)
+            modal_open_event = asyncio.Event()
             gameplay = asyncio.create_task(
-                llm_driven_gameplay_loop(browser, llm, play_instructions, detected_types, detections_list, stop_event)
+                llm_gameplay_only_loop(page, llm, play_instructions, stop_event, modal_open_event)
+            )
+            detector = asyncio.create_task(
+                detector_loop(
+                    browser,
+                    llm,
+                    detected_types,
+                    detections_list,
+                    stop_event,
+                    page=page,
+                    modal_open_event=modal_open_event,
+                )
             )
             try:
-                await asyncio.wait_for(asyncio.shield(gameplay), timeout=DETECTOR_TIMEOUT_SEC)
+                await asyncio.wait_for(asyncio.shield(detector), timeout=DETECTOR_TIMEOUT_SEC)
             except asyncio.TimeoutError:
                 print("\n⏱️ Timeout reached.", flush=True)
             finally:
                 stop_event.set()
                 gameplay.cancel()
+                detector.cancel()
                 try:
                     await gameplay
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    await detector
                 except asyncio.CancelledError:
                     pass
         else:
@@ -641,7 +1059,7 @@ async def run_async():
             print("-" * 50, flush=True)
             player = asyncio.create_task(player_loop(browser, center_x, center_y, stop_event))
             detector = asyncio.create_task(
-                detector_loop(browser, llm, detected_types, detections_list, stop_event)
+                detector_loop(browser, llm, detected_types, detections_list, stop_event, page=page)
             )
             try:
                 await asyncio.wait_for(asyncio.shield(detector), timeout=DETECTOR_TIMEOUT_SEC)
